@@ -1,6 +1,7 @@
 # Anonymous Feedback Board
 
 A Midnight smart contract DApp where registered members submit feedback to a public board without ever revealing which member wrote which entry.
+demo video: http://localhost:3000/
 
 [![Generic badge](https://img.shields.io/badge/Compact%20language-0.23-1abc9c.svg)](https://shields.io/)
 [![Generic badge](https://img.shields.io/badge/TypeScript-5.9.3-blue.svg)](https://shields.io/)
