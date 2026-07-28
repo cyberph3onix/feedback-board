@@ -1,0 +1,107 @@
+// Anonymous Feedback Board
+//
+// A Midnight smart contract that lets registered members post feedback to a
+// public board without ever revealing which member authored which entry.
+//
+// PUBLIC DATA (visible to anyone reading the ledger):
+//   - admin          : a commitment to the admin's identity (never the identity itself)
+//   - members        : commitments to the identities of members allowed to post
+//   - round          : the current feedback round number
+//   - nextId         : the id that will be assigned to the next feedback entry
+//   - feedbacks      : the public feed of feedback entries, keyed by id
+//   - nullifiers     : spent one-time tokens that stop a member posting twice in one round
+//
+// PRIVATE DATA (never leaves the caller's machine):
+//   - localSecretKey : a member's (or the admin's) personal secret key, supplied by a witness
+//
+// PRIVACY GUARANTEE:
+//   Membership and admin rights are proven in zero-knowledge from `localSecretKey`; the
+//   secret key itself is never disclosed and never appears on-chain in any form. Real-world
+//   identity is never collected by the contract at all -- members are whitelisted purely by
+//   a public commitment to their secret key, handed to the admin out-of-band.
+//
+//   Proving Set membership in zero-knowledge requires disclosing the value being checked, so
+//   `submitFeedback` discloses `memberKey(localSecretKey())`: a one-way hash of the caller's
+//   secret key. This reveals a stable per-member pseudonym (so a member's own posts are
+//   linkable to each other) but never their identity or secret key. Each submission also
+//   discloses a fresh nullifier, scoped to the current round, which lets the contract reject
+//   a second post from the same member in the same round without learning who posted first.
+//   The feedback content itself is intentionally public -- that's the point of a feedback
+//   *board* -- only the link between content and real-world author identity is hidden.
+
+pragma language_version 0.23;
+
+import CompactStandardLibrary;
+
+export ledger admin: Bytes<32>;
+export ledger members: Set<Bytes<32>>;
+export ledger round: Counter;
+export ledger nextId: Counter;
+export ledger feedbacks: Map<Uint<64>, Opaque<"string">>;
+export ledger nullifiers: Set<Bytes<32>>;
+
+constructor() {
+  admin = pad(32, "");
+  round.increment(1);
+}
+
+witness localSecretKey(): Bytes<32>;
+
+// Derives a role-scoped public commitment from a secret key. Two different
+// "tag" constants keep the admin and member key-spaces from colliding.
+export circuit adminKey(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "feedback-board:admin:"), sk]);
+}
+
+export circuit memberKey(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "feedback-board:member:"), sk]);
+}
+
+// Derives a one-time nullifier for a given secret key and round. Reusing the
+// same secret key in the same round always produces the same nullifier,
+// which is what lets us detect (and reject) a double post -- without ever
+// learning which member the nullifier belongs to.
+export circuit nullifierFor(sk: Bytes<32>, roundTag: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "feedback-board:null:"), roundTag, sk]);
+}
+
+// Claims the (one-time) admin role for whoever calls this first.
+export circuit registerAdmin(): [] {
+  assert(admin == pad(32, ""), "Admin has already been registered");
+  admin = disclose(adminKey(localSecretKey()));
+}
+
+// Admin-only: whitelists a new member by their public commitment. The
+// commitment is computed off-chain by the member (from their own secret
+// key) and handed to the admin out-of-band -- the member's secret key
+// itself never touches the chain.
+export circuit addMember(memberPk: Bytes<32>): [] {
+  assert(adminKey(localSecretKey()) == admin, "Only the admin can add members");
+  members.insert(disclose(memberPk));
+}
+
+// Admin-only: opens a fresh feedback round, letting every member submit
+// one new piece of feedback again.
+export circuit openNewRound(): [] {
+  assert(adminKey(localSecretKey()) == admin, "Only the admin can open a new round");
+  round.increment(1);
+}
+
+// Members-only: anonymously appends feedback to the public board.
+//
+// Checking Set membership in zero-knowledge requires disclosing the value being
+// checked, so this discloses `memberKey(localSecretKey())` -- a one-way hash of the
+// caller's secret key, not the key itself, and never their real-world identity. The
+// same member's submissions are therefore linkable to each other via this pseudonym,
+// but not to who they are.
+export circuit submitFeedback(content: Opaque<"string">): [] {
+  const mk = disclose(memberKey(localSecretKey()));
+  assert(members.member(mk), "Only registered members may submit feedback");
+
+  const nul = disclose(nullifierFor(localSecretKey(), round as Field as Bytes<32>));
+  assert(!nullifiers.member(nul), "This member has already submitted feedback for the current round");
+  nullifiers.insert(nul);
+
+  feedbacks.insert(disclose(nextId), disclose(content));
+  nextId.increment(1);
+}

@@ -1,77 +1,59 @@
-// This file is part of midnightntwrk/example-bboard.
-// Copyright (C) Midnight Foundation
-// SPDX-License-Identifier: Apache-2.0
-// Licensed under the Apache License, Version 2.0 (the "License");
-// You may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 /**
- * Provides types and utilities for working with bulletin board contracts.
+ * Provides types and utilities for working with anonymous feedback board contracts.
  *
  * @packageDocumentation
  */
 
-import * as BBoard from '../../contract/src/managed/bboard/contract/index.js';
+import * as FeedbackBoard from '../../contract/src/managed/feedback-board/contract/index.js';
 
 import { type ContractAddress, convertFieldToBytes } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
 import { type Logger } from 'pino';
 import {
-  type BBoardDerivedState,
-  type BBoardContract,
-  type BBoardProviders,
-  type DeployedBBoardContract,
-  bboardPrivateStateKey,
+  type FeedbackBoardDerivedState,
+  type FeedbackBoardContract,
+  type FeedbackBoardProviders,
+  type DeployedFeedbackBoardContract,
+  type FeedbackEntry,
+  feedbackBoardPrivateStateKey,
 } from './common-types.js';
-import { CompiledBBoardContractContract } from '../../contract/src/index';
+import { CompiledFeedbackBoardContractContract } from '../../contract/src/index';
 import * as utils from './utils/index.js';
 import { deployContract, findDeployedContract } from '@midnight-ntwrk/midnight-js-contracts';
 import { combineLatest, map, tap, from, type Observable } from 'rxjs';
 import { toHex } from '@midnight-ntwrk/midnight-js-utils';
-import { BBoardPrivateState, createBBoardPrivateState } from '../../contract/src/witnesses.js';
+import { FeedbackBoardPrivateState, createFeedbackBoardPrivateState } from '../../contract/src/witnesses.js';
 
 /** @internal */
 
 /**
- * An API for a deployed bulletin board.
+ * An API for a deployed anonymous feedback board.
  */
-export interface DeployedBBoardAPI {
+export interface DeployedFeedbackBoardAPI {
   readonly deployedContractAddress: ContractAddress;
-  readonly state$: Observable<BBoardDerivedState>;
+  readonly state$: Observable<FeedbackBoardDerivedState>;
 
-  post: (message: string) => Promise<void>;
-  takeDown: () => Promise<void>;
+  registerAdmin: () => Promise<void>;
+  addMember: (memberPk: Uint8Array) => Promise<void>;
+  openNewRound: () => Promise<void>;
+  submitFeedback: (content: string) => Promise<void>;
 }
 
 /**
- * Provides an implementation of {@link DeployedBBoardAPI} by adapting a deployed bulletin board
- * contract.
+ * Provides an implementation of {@link DeployedFeedbackBoardAPI} by adapting a deployed
+ * anonymous feedback board contract.
  *
  * @remarks
- * The `BBoardPrivateState` is managed at the DApp level by a private state provider. As such, this
- * private state is shared between all instances of {@link BBoardAPI}, and their underlying deployed
- * contracts. The private state defines a `'secretKey'` property that effectively identifies the current
- * user, and is used to determine if the current user is the owner of the message as the observable
- * contract state changes.
- *
- * In the future, Midnight.js will provide a private state provider that supports private state storage
- * keyed by contract address. This will remove the current workaround of sharing private state across
- * the deployed bulletin board contracts, and allows for a unique secret key to be generated for each bulletin
- * board that the user interacts with.
+ * The `FeedbackBoardPrivateState` is managed at the DApp level by a private state provider. As
+ * such, this private state is shared between all instances of {@link FeedbackBoardAPI}, and their
+ * underlying deployed contracts. The private state defines a `'secretKey'` property that
+ * effectively identifies the current user, and is used to determine that user's role (admin,
+ * member, neither) as the observable contract state changes.
  */
-// TODO: Update BBoardAPI to use contract level private state storage.
-export class BBoardAPI implements DeployedBBoardAPI {
+export class FeedbackBoardAPI implements DeployedFeedbackBoardAPI {
   /** @internal */
   private constructor(
-    public readonly deployedContract: DeployedBBoardContract,
-    providers: BBoardProviders,
+    public readonly deployedContract: DeployedFeedbackBoardContract,
+    providers: FeedbackBoardProviders,
     private readonly logger?: Logger,
   ) {
     this.deployedContractAddress = deployedContract.deployTxData.public.contractAddress;
@@ -80,37 +62,50 @@ export class BBoardAPI implements DeployedBBoardAPI {
       [
         // Combine public (ledger) state with...
         providers.publicDataProvider.contractStateObservable(this.deployedContractAddress, { type: 'latest' }).pipe(
-          map((contractState) => BBoard.ledger(contractState.data)),
+          map((contractState) => FeedbackBoard.ledger(contractState.data)),
           tap((ledgerState) =>
             logger?.trace({
               ledgerStateChanged: {
                 ledgerState: {
-                  ...ledgerState,
-                  state: ledgerState.state === BBoard.State.OCCUPIED ? 'occupied' : 'vacant',
-                  owner: toHex(ledgerState.owner),
+                  admin: toHex(ledgerState.admin),
+                  round: ledgerState.round,
+                  memberCount: ledgerState.members.size(),
+                  feedbackCount: ledgerState.feedbacks.size(),
                 },
               },
             }),
           ),
         ),
         // ...private state...
-        //    since the private state of the bulletin board application never changes, we can query the
-        //    private state once and always use the same value with `combineLatest`. In applications
-        //    where the private state is expected to change, we would need to make this an `Observable`.
-        from(providers.privateStateProvider.get(bboardPrivateStateKey) as Promise<BBoardPrivateState>),
+        //    since the private state of the feedback board application never changes, we can query
+        //    the private state once and always use the same value with `combineLatest`. In
+        //    applications where the private state is expected to change, we would need to make this
+        //    an `Observable`.
+        from(providers.privateStateProvider.get(feedbackBoardPrivateStateKey) as Promise<FeedbackBoardPrivateState>),
       ],
       // ...and combine them to produce the required derived state.
       (ledgerState, privateState) => {
-        const hashedSecretKey = BBoard.pureCircuits.publicKey(
-          privateState.secretKey,
-          convertFieldToBytes(32, ledgerState.sequence, 'api/src/index.ts'),
+        const secretKey = privateState.secretKey;
+        const ownAdminKey = FeedbackBoard.pureCircuits.adminKey(secretKey);
+        const ownMemberKey = FeedbackBoard.pureCircuits.memberKey(secretKey);
+        const ownNullifier = FeedbackBoard.pureCircuits.nullifierFor(
+          secretKey,
+          convertFieldToBytes(32, ledgerState.round, 'api/src/index.ts'),
+        );
+
+        const feedbacks: FeedbackEntry[] = Array.from(ledgerState.feedbacks, ([id, content]) => ({ id, content })).sort(
+          (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
         );
 
         return {
-          state: ledgerState.state,
-          message: ledgerState.message.value,
-          sequence: ledgerState.sequence,
-          isOwner: toHex(ledgerState.owner) === toHex(hashedSecretKey),
+          admin: ledgerState.admin,
+          round: ledgerState.round,
+          memberCount: ledgerState.members.size(),
+          feedbacks,
+          isAdmin: toHex(ledgerState.admin) === toHex(ownAdminKey),
+          isMember: ledgerState.members.member(ownMemberKey),
+          hasSubmittedThisRound: ledgerState.nullifiers.member(ownNullifier),
+          ownMemberKey,
         };
       },
     );
@@ -125,24 +120,22 @@ export class BBoardAPI implements DeployedBBoardAPI {
    * Gets an observable stream of state changes based on the current public (ledger),
    * and private state data.
    */
-  readonly state$: Observable<BBoardDerivedState>;
+  readonly state$: Observable<FeedbackBoardDerivedState>;
 
   /**
-   * Attempts to post a given message to the bulletin board.
-   *
-   * @param message The message to post.
+   * Attempts to claim the (one-time) admin role for the current user.
    *
    * @remarks
-   * This method can fail during local circuit execution if the bulletin board is currently occupied.
+   * This method can fail during local circuit execution if an admin has already registered.
    */
-  async post(message: string): Promise<void> {
-    this.logger?.info(`postingMessage: ${message}`);
+  async registerAdmin(): Promise<void> {
+    this.logger?.info('registeringAdmin');
 
-    const txData = await this.deployedContract.callTx.post(message);
+    const txData = await this.deployedContract.callTx.registerAdmin();
 
     this.logger?.trace({
       transactionAdded: {
-        circuit: 'post',
+        circuit: 'registerAdmin',
         txHash: txData.public.txHash,
         blockHeight: txData.public.blockHeight,
       },
@@ -150,21 +143,22 @@ export class BBoardAPI implements DeployedBBoardAPI {
   }
 
   /**
-   * Attempts to take down any currently posted message on the bulletin board.
+   * Attempts to whitelist a new member by their public key commitment.
+   *
+   * @param memberPk The prospective member's public key commitment, as returned by
+   * {@link FeedbackBoardDerivedState.ownMemberKey} on their own device.
    *
    * @remarks
-   * This method can fail during local circuit execution if the bulletin board is currently vacant,
-   * or if the currently posted message isn't owned by the owner computed from the current private
-   * state.
+   * This method can fail during local circuit execution if the current user isn't the registered admin.
    */
-  async takeDown(): Promise<void> {
-    this.logger?.info('takingDownMessage');
+  async addMember(memberPk: Uint8Array): Promise<void> {
+    this.logger?.info('addingMember');
 
-    const txData = await this.deployedContract.callTx.takeDown();
+    const txData = await this.deployedContract.callTx.addMember(memberPk);
 
     this.logger?.trace({
       transactionAdded: {
-        circuit: 'takeDown',
+        circuit: 'addMember',
         txHash: txData.public.txHash,
         blockHeight: txData.public.blockHeight,
       },
@@ -172,70 +166,117 @@ export class BBoardAPI implements DeployedBBoardAPI {
   }
 
   /**
-   * Deploys a new bulletin board contract to the network.
+   * Attempts to open a new feedback round, allowing every member to submit feedback again.
    *
-   * @param providers The bulletin board providers.
+   * @remarks
+   * This method can fail during local circuit execution if the current user isn't the registered admin.
+   */
+  async openNewRound(): Promise<void> {
+    this.logger?.info('openingNewRound');
+
+    const txData = await this.deployedContract.callTx.openNewRound();
+
+    this.logger?.trace({
+      transactionAdded: {
+        circuit: 'openNewRound',
+        txHash: txData.public.txHash,
+        blockHeight: txData.public.blockHeight,
+      },
+    });
+  }
+
+  /**
+   * Attempts to anonymously submit a new piece of feedback to the board.
+   *
+   * @param content The feedback text to submit.
+   *
+   * @remarks
+   * This method can fail during local circuit execution if the current user isn't a registered
+   * member, or if they have already submitted feedback in the current round.
+   */
+  async submitFeedback(content: string): Promise<void> {
+    this.logger?.info(`submittingFeedback: ${content}`);
+
+    const txData = await this.deployedContract.callTx.submitFeedback(content);
+
+    this.logger?.trace({
+      transactionAdded: {
+        circuit: 'submitFeedback',
+        txHash: txData.public.txHash,
+        blockHeight: txData.public.blockHeight,
+      },
+    });
+  }
+
+  /**
+   * Deploys a new anonymous feedback board contract to the network.
+   *
+   * @param providers The feedback board providers.
    * @param logger An optional 'pino' logger to use for logging.
-   * @returns A `Promise` that resolves with a {@link BBoardAPI} instance that manages the newly deployed
-   * {@link DeployedBBoardContract}; or rejects with a deployment error.
+   * @returns A `Promise` that resolves with a {@link FeedbackBoardAPI} instance that manages the
+   * newly deployed {@link DeployedFeedbackBoardContract}; or rejects with a deployment error.
    */
-  static async deploy(providers: BBoardProviders, logger?: Logger): Promise<BBoardAPI> {
+  static async deploy(providers: FeedbackBoardProviders, logger?: Logger): Promise<FeedbackBoardAPI> {
     logger?.info('deployContract');
 
-    const deployedBBoardContract = await deployContract(providers, {
-      compiledContract: CompiledBBoardContractContract,
-      privateStateId: bboardPrivateStateKey,
-      initialPrivateState: createBBoardPrivateState(utils.randomBytes(32)),
+    const deployedFeedbackBoardContract = await deployContract(providers, {
+      compiledContract: CompiledFeedbackBoardContractContract,
+      privateStateId: feedbackBoardPrivateStateKey,
+      initialPrivateState: createFeedbackBoardPrivateState(utils.randomBytes(32)),
     });
 
     logger?.trace({
       contractDeployed: {
-        finalizedDeployTxData: deployedBBoardContract.deployTxData.public,
+        finalizedDeployTxData: deployedFeedbackBoardContract.deployTxData.public,
       },
     });
 
-    return new BBoardAPI(deployedBBoardContract, providers, logger);
+    return new FeedbackBoardAPI(deployedFeedbackBoardContract, providers, logger);
   }
 
   /**
-   * Finds an already deployed bulletin board contract on the network, and joins it.
+   * Finds an already deployed anonymous feedback board contract on the network, and joins it.
    *
-   * @param providers The bulletin board providers.
-   * @param contractAddress The contract address of the deployed bulletin board contract to search for and join.
+   * @param providers The feedback board providers.
+   * @param contractAddress The contract address of the deployed feedback board contract to search for and join.
    * @param logger An optional 'pino' logger to use for logging.
-   * @returns A `Promise` that resolves with a {@link BBoardAPI} instance that manages the joined
-   * {@link DeployedBBoardContract}; or rejects with an error.
+   * @returns A `Promise` that resolves with a {@link FeedbackBoardAPI} instance that manages the joined
+   * {@link DeployedFeedbackBoardContract}; or rejects with an error.
    */
-  static async join(providers: BBoardProviders, contractAddress: ContractAddress, logger?: Logger): Promise<BBoardAPI> {
+  static async join(
+    providers: FeedbackBoardProviders,
+    contractAddress: ContractAddress,
+    logger?: Logger,
+  ): Promise<FeedbackBoardAPI> {
     logger?.info({
       joinContract: {
         contractAddress,
       },
     });
 
-    const deployedBBoardContract = await findDeployedContract<BBoardContract>(providers, {
+    const deployedFeedbackBoardContract = await findDeployedContract<FeedbackBoardContract>(providers, {
       contractAddress,
-      compiledContract: CompiledBBoardContractContract,
-      privateStateId: bboardPrivateStateKey,
-      initialPrivateState: await BBoardAPI.getPrivateState(providers, contractAddress),
+      compiledContract: CompiledFeedbackBoardContractContract,
+      privateStateId: feedbackBoardPrivateStateKey,
+      initialPrivateState: await FeedbackBoardAPI.getPrivateState(providers, contractAddress),
     });
 
     logger?.trace({
       contractJoined: {
-        finalizedDeployTxData: deployedBBoardContract.deployTxData.public,
+        finalizedDeployTxData: deployedFeedbackBoardContract.deployTxData.public,
       },
     });
 
-    return new BBoardAPI(deployedBBoardContract, providers, logger);
+    return new FeedbackBoardAPI(deployedFeedbackBoardContract, providers, logger);
   }
 
   private static async getPrivateState(
-    providers: BBoardProviders,
+    providers: FeedbackBoardProviders,
     contractAddress: ContractAddress,
-  ): Promise<BBoardPrivateState> {
+  ): Promise<FeedbackBoardPrivateState> {
     providers.privateStateProvider.setContractAddress(contractAddress);
-    const existingPrivateState = await providers.privateStateProvider.get(bboardPrivateStateKey);
-    return existingPrivateState ?? createBBoardPrivateState(utils.randomBytes(32));
+    const existingPrivateState = await providers.privateStateProvider.get(feedbackBoardPrivateStateKey);
+    return existingPrivateState ?? createFeedbackBoardPrivateState(utils.randomBytes(32));
   }
 }
 

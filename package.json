@@ -1,5 +1,5 @@
 {
-  "name": "@midnight-ntwrk/example-bboard",
+  "name": "feedback-board",
   "version": "0.1.0",
   "author": "IOG",
   "license": "MIT",
@@ -8,10 +8,15 @@
   "engines": {
     "node": ">=24.11.1"
   },
+  "scripts": {
+    "compact": "npm run compact -w contract",
+    "build": "npm run build -w contract && npm run build -w api && npm run build -w feedback-board-cli && npm run build -w feedback-board-ui",
+    "postinstall": "patch-package"
+  },
   "workspaces": {
     "packages": [
-      "bboard-cli",
-      "bboard-ui",
+      "feedback-board-cli",
+      "feedback-board-ui",
       "api",
       "contract"
     ]
@@ -53,6 +58,7 @@
     "eslint-plugin-prettier": "^5.5.6",
     "eslint-plugin-react": "^7.37.5",
     "http-server": "^14.1.1",
+    "patch-package": "^8.0.1",
     "prettier": "^3.8.4",
     "rollup": "^4.62.2",
     "ts-node": "^10.9.2",
